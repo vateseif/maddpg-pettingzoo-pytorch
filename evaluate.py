@@ -6,12 +6,12 @@ import matplotlib.pyplot as plt
 from PIL import Image
 
 from MADDPG import MADDPG
-from main import get_env
+from main import get_env, name2env
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('env_name', type=str, default='simple_adversary_v2', help='name of the env',
-                        choices=['simple_adversary_v2', 'simple_spread_v2', 'simple_tag_v2', 'simple_world_comm_v2', 'simple_reference_v2'])
+                        choices=list(name2env.keys()))
     parser.add_argument('folder', type=str, help='name of the folder where model is saved')
     parser.add_argument('--episode-num', type=int, default=10, help='total episode num during evaluation')
     parser.add_argument('--episode-length', type=int, default=50, help='steps per episode')
