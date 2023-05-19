@@ -60,7 +60,7 @@ class MADDPG:
     def sample(self, batch_size):
         """sample experience from all the agents' buffers, and collect data for network input"""
         # get the total num of transitions, these buffers should have same number of transitions
-        total_num = len(self.buffers['agent_0'])
+        total_num = len(self.buffers[list(self.agents.keys())[0]])
         indices = np.random.choice(total_num, size=batch_size, replace=False)
 
         # NOTE that in MADDPG, we need the obs and actions of all agents
