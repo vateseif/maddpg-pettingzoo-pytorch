@@ -7,7 +7,6 @@ import numpy as np
 import torch.nn.functional as F
 from torch import nn, Tensor
 from torch.optim import Adam
-from cvxpylayers.torch import CvxpyLayer
 
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -20,7 +19,6 @@ class Agent:
         self.actor = MLPNetwork(obs_dim, act_dim).to(device)
         if use_mpc:
           self.mpc = LMPCLayer()
-          self.mpc_layer = self.mpc.export()
 
         # critic input all the observations and actions
         # if there are 3 agents for example, the input for critic is (obs1, obs2, obs3, act1, act2, act3)
@@ -48,13 +46,11 @@ class Agent:
         batch_dim, act_dim = logits.shape
         # action = self.gumbel_softmax(logits)
         if self.use_mpc:
-          T, Nx, Nu = self.mpc.T, self.mpc.Ns, self.mpc.Na
           actions = []
           for i in range(batch_dim):
-            x0 = torch.vstack((torch.ones((2,1))*1e-3, torch.tensor([[obs[i][0]], [obs[i][1]]])))
-            action = self.mpc_layer(x0, torch.reshape(logits[i], (act_dim,1)))[0][Nx*(T+1):Nx*(T+1)+Nu, :Nx] @ x0
-            action = torch.hstack((torch.ones((1,)), action.squeeze(1)))
-            actions.append(action)
+            x0 = np.concatenate((np.ones((2,1))*1e-3, np.array([[obs[i][0]], [obs[i][1]]])))
+            action = self.mpc.act(x0, torch.reshape(logits[i], (act_dim,1)).detach().numpy())
+            actions.append(torch.tensor(action))
           actions = torch.vstack(actions)
         else:
           actions = F.gumbel_softmax(logits, hard=True)
@@ -71,13 +67,11 @@ class Agent:
         batch_dim, act_dim = logits.shape
         # action = self.gumbel_softmax(logits)
         if self.use_mpc:
-          T, Nx, Nu = self.mpc.T, self.mpc.Ns, self.mpc.Na
           actions = []
           for i in range(batch_dim):
-            x0 = torch.vstack((torch.ones((2,1))*1e-3, torch.tensor([[obs[i][0]], [obs[i][1]]])))
-            action = self.mpc_layer(x0, torch.reshape(logits[i], (act_dim,1)))[0][Nx*(T+1):Nx*(T+1)+Nu, :Nx] @ x0
-            action = torch.hstack((torch.ones((1,)), action.squeeze(1)))
-            actions.append(action)
+            x0 = np.concatenate((np.ones((2,1))*1e-3, np.array([[obs[i][0]], [obs[i][1]]])))
+            action = self.mpc.act(x0, torch.reshape(logits[i], (act_dim,1)).detach().numpy())
+            actions.append(torch.tensor(action))
           actions = torch.vstack(actions)
         else:
           actions = F.gumbel_softmax(logits, hard=True)
@@ -197,9 +191,10 @@ class LMPCLayer:
 
     return controller
 
-  def export(self):
-    prob = self.controller.prob
-    variables = [self.controller.phi]
-    parameters = [self.controller.x0, self.controller.objectives[0].xTd]
-    return CvxpyLayer(prob, parameters, variables)
+  def act(self, x0, logits):
+    self.controller.objectives[0].xTd.value = logits
+    u, _, _ = self.controller.solve(x0, "SCS")
+    action = np.concatenate(([1e-3], u.squeeze()[0:self.Na]), dtype=np.float32)
+      
+    return action
 
