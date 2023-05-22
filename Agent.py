@@ -43,6 +43,7 @@ class Agent:
         # torch.Size([batch_size, state_dim])
         
         logits = self.actor(obs.to(device))  # torch.Size([batch_size, action_size])
+        print(logits)
         batch_dim, act_dim = logits.shape
         # action = self.gumbel_softmax(logits)
         if self.use_mpc:
@@ -194,7 +195,7 @@ class LMPCLayer:
   def act(self, x0, logits):
     self.controller.objectives[0].xTd.value = logits
     u, _, _ = self.controller.solve(x0, "SCS")
-    action = np.concatenate(([1e-3], u.squeeze()[0:self.Na]), dtype=np.float32)
+    action = np.concatenate(([0], u.squeeze()[0:self.Na]), dtype=np.float32)
       
     return action
 
