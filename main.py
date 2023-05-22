@@ -14,15 +14,26 @@ name2env = {"simple_adversary_v2":        simple_adversary_v2.parallel_env,
           "simple_reference_v2":          simple_reference_v2.parallel_env,
           "simple_speaker_listener_v3":   simple_speaker_listener_v3.parallel_env}
 
-def get_env(env_name, ep_len=25):
+def get_env(env_name, ep_len=25, discrete=True):
     """create environment and get observation and action dimension of each agent in this environment"""
-    new_env = name2env[env_name](max_cycles=ep_len)
+    new_env = name2env[env_name](max_cycles=ep_len, continuous_actions = not discrete)
     new_env.reset()
     _dim_info = {}
     for agent_id in new_env.agents:
-        _dim_info[agent_id] = []  # [obs_dim, act_dim]
-        _dim_info[agent_id].append(new_env.observation_space(agent_id).shape[0])
-        _dim_info[agent_id].append(new_env.action_space(agent_id).n)
+        _dim_info[agent_id] = []  # [obs_dim, act_dim, _use_mpc]
+        obs_dim = new_env.observation_space(agent_id).shape[0]
+        # If use_mpc, the output of the NN is only the desired terminal position
+        # TODO: for the moment this only works with listener (simple_speaker_listener)
+        # when adding new envs check for the action of the agents size and whether they can communicate or not
+        if not discrete:
+          act_dim = new_env.action_space(agent_id).shape[0]
+        else:
+          act_dim = new_env.action_space(agent_id).n
+        _use_mpc = agent_id.startswith('listener') and not discrete
+        
+        _dim_info[agent_id].append(obs_dim)
+        _dim_info[agent_id].append(act_dim)
+        _dim_info[agent_id].append(_use_mpc)
 
     return new_env, _dim_info
 
@@ -44,6 +55,8 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=1024, help='batch-size of replay buffer')
     parser.add_argument('--actor_lr', type=float, default=0.01, help='learning rate of actor')
     parser.add_argument('--critic_lr', type=float, default=0.01, help='learning rate of critic')
+    parser.add_argument('--discrete', type=int, default=1, choices=[0,1], help='Discrete action space. If Falses it uses MPC')
+    
     args = parser.parse_args()
 
     # create folder to save result
@@ -53,10 +66,10 @@ if __name__ == '__main__':
     total_files = len([file for file in os.listdir(env_dir)])
     result_dir = os.path.join(env_dir, f'{total_files + 1}')
     os.makedirs(result_dir)
-
-    env, dim_info = get_env(args.env_name, args.episode_length)
+    print(f'Discrete: {args.discrete}')
+    env, dim_info = get_env(args.env_name, args.episode_length, args.discrete)
     maddpg = MADDPG(dim_info, args.buffer_capacity, args.batch_size, args.actor_lr, args.critic_lr,
-                    result_dir)
+                    result_dir, args.discrete)
 
     step = 0  # global step counter
     agent_num = env.num_agents

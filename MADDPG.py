@@ -28,19 +28,21 @@ def setup_logger(filename):
 class MADDPG:
     """A MADDPG(Multi Agent Deep Deterministic Policy Gradient) agent"""
 
-    def __init__(self, dim_info, capacity, batch_size, actor_lr, critic_lr, res_dir):
+    def __init__(self, dim_info, capacity, batch_size, actor_lr, critic_lr, res_dir, discrete):
         # sum all the dims of each agent to get input dim for critic
-        global_obs_act_dim = sum(sum(val) for val in dim_info.values())
+        global_obs_act_dim = sum(sum(val[:-1]) for val in dim_info.values())
         # create Agent(actor-critic) and replay buffer for each agent
         self.agents = {}
         self.buffers = {}
-        for agent_id, (obs_dim, act_dim) in dim_info.items():
-            self.agents[agent_id] = Agent(obs_dim, act_dim, global_obs_act_dim, actor_lr, critic_lr)
-            self.buffers[agent_id] = Buffer(capacity, obs_dim, act_dim, device)
+        for agent_id, (_obs_dim, _act_dim, _use_mpc) in dim_info.items():
+            act_dim = _act_dim if not _use_mpc else int((_act_dim-1)/2)
+            self.agents[agent_id] = Agent(_obs_dim, act_dim, global_obs_act_dim, actor_lr, critic_lr, _use_mpc)
+            self.buffers[agent_id] = Buffer(capacity, _obs_dim, _act_dim, device)
         self.dim_info = dim_info
 
         self.batch_size = batch_size
         self.res_dir = res_dir  # directory to save the training result
+        self.discrete = discrete
         self.logger = setup_logger(os.path.join(res_dir, 'maddpg.log'))
 
     def add(self, obs, action, reward, next_obs, done):
@@ -84,7 +86,8 @@ class MADDPG:
             o = torch.from_numpy(o).unsqueeze(0).float()
             a = self.agents[agent].action(o)  # torch.Size([1, action_size])
             # NOTE that the output is a tensor, convert it to int before input to the environment
-            actions[agent] = a.squeeze(0).argmax().item()
+            action = a.squeeze(0).argmax().item() if self.discrete else a.squeeze(0).detach()
+            actions[agent] = action
             self.logger.info(f'{agent} action: {actions[agent]}')
         return actions
 

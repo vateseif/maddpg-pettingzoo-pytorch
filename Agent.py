@@ -1,18 +1,26 @@
 from copy import deepcopy
-from typing import List
+from typing import List, Optional
 
+import lmpc
 import torch
+import numpy as np
 import torch.nn.functional as F
 from torch import nn, Tensor
 from torch.optim import Adam
+from cvxpylayers.torch import CvxpyLayer
+
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 class Agent:
     """Agent that can interact with environment from pettingzoo"""
 
-    def __init__(self, obs_dim, act_dim, global_obs_dim, actor_lr, critic_lr):
+    def __init__(self, obs_dim, act_dim, global_obs_dim, actor_lr, critic_lr, use_mpc=False):
+        self.use_mpc = use_mpc
         self.actor = MLPNetwork(obs_dim, act_dim).to(device)
+        if use_mpc:
+          self.mpc = LMPCLayer()
+          self.mpc_layer = self.mpc.export()
 
         # critic input all the observations and actions
         # if there are 3 agents for example, the input for critic is (obs1, obs2, obs3, act1, act2, act3)
@@ -35,13 +43,24 @@ class Agent:
         # a) interact with the environment
         # b) calculate action when update actor, where input(obs) is sampled from replay buffer with size:
         # torch.Size([batch_size, state_dim])
-
+        
         logits = self.actor(obs.to(device))  # torch.Size([batch_size, action_size])
+        batch_dim, act_dim = logits.shape
         # action = self.gumbel_softmax(logits)
-        action = F.gumbel_softmax(logits, hard=True)
+        if self.use_mpc:
+          T, Nx, Nu = self.mpc.T, self.mpc.Ns, self.mpc.Na
+          actions = []
+          for i in range(batch_dim):
+            x0 = torch.vstack((torch.ones((2,1))*1e-3, torch.tensor([[obs[i][0]], [obs[i][1]]])))
+            action = self.mpc_layer(x0, torch.reshape(logits[i], (act_dim,1)))[0][Nx*(T+1):Nx*(T+1)+Nu, :Nx] @ x0
+            action = torch.hstack((torch.ones((1,)), action.squeeze(1)))
+            actions.append(action)
+          actions = torch.vstack(actions)
+        else:
+          actions = F.gumbel_softmax(logits, hard=True)
         if model_out:
-            return action, logits
-        return action
+            return actions, logits
+        return actions
 
     def target_action(self, obs):
         # when calculate target critic value in MADDPG,
@@ -49,9 +68,20 @@ class Agent:
         # which is sampled from replay buffer with size torch.Size([batch_size, state_dim])
 
         logits = self.target_actor(obs.to(device))  # torch.Size([batch_size, action_size])
+        batch_dim, act_dim = logits.shape
         # action = self.gumbel_softmax(logits)
-        action = F.gumbel_softmax(logits, hard=True)
-        return action.squeeze(0).detach()
+        if self.use_mpc:
+          T, Nx, Nu = self.mpc.T, self.mpc.Ns, self.mpc.Na
+          actions = []
+          for i in range(batch_dim):
+            x0 = torch.vstack((torch.ones((2,1))*1e-3, torch.tensor([[obs[i][0]], [obs[i][1]]])))
+            action = self.mpc_layer(x0, torch.reshape(logits[i], (act_dim,1)))[0][Nx*(T+1):Nx*(T+1)+Nu, :Nx] @ x0
+            action = torch.hstack((torch.ones((1,)), action.squeeze(1)))
+            actions.append(action)
+          actions = torch.vstack(actions)
+        else:
+          actions = F.gumbel_softmax(logits, hard=True)
+        return actions
 
     def critic_value(self, state_list: List[Tensor], act_list: List[Tensor]):
         x = torch.cat(state_list + act_list, 1)
@@ -96,3 +126,80 @@ class MLPNetwork(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
+
+class LMPCLayer:
+
+  def __init__(self, locality: Optional[str]=None) -> None:
+    self.N = 1
+    self.locality = locality
+    
+    self.Ns = 4
+    self.Na = 4
+    self.T = 15
+    self.dt = 0.1              # TODO get val from env
+    self.tau = 0.25            # TODO get val from env
+    self.eps = 1e-3
+    self.size = 0.075
+    self.max_speed = None
+    self.sensitivity = 5.
+
+    # system model
+    self.sys = self._init_model()
+    
+    # controller
+    self.controller = self._init_controller()
+
+  def _init_model(self):
+    # dynamics of 1 single agent
+    A1 = np.array([[0, 0, 1, 0], 
+                  [0, 0, 0, 1], 
+                  [0, 0, -self.tau/self.dt, 0], 
+                  [0, 0, 0, -self.tau/self.dt]])
+    B1 = np.array([[0, 0, 0, 0], 
+                  [0, 0, 0, 0], 
+                  [1, -1, 0, 0], 
+                  [0, 0, 1, -1]]) 
+    # dynamics of n agents
+    A = np.kron(np.eye(self.N), A1)
+    B = np.kron(np.eye(self.N), B1)
+    # discrete dynamics
+    Ad = np.eye(A.shape[0]) + A*self.dt
+    Bd = B*self.dt*self.sensitivity
+    
+    # init sys
+    sys = lmpc.DistributedLTI(self.N, self.Ns, self.Na)
+    sys.loadAB(Ad, Bd)
+
+    # locality model
+    if self.locality != None:
+      locality = None
+      sys << locality
+      pass
+    return sys
+
+  def _init_controller(self):
+    # controller
+    controller = lmpc.LMPC(self.T)
+    controller << self.sys
+    
+    # box constraints control inputs
+    controller.addConstraint(lmpc.BoundConstraint('u', 'upper', (1-self.eps)*np.ones((self.sys.Nu,1))))
+    controller.addConstraint(lmpc.BoundConstraint('u', 'lower', self.eps * np.ones((self.sys.Nu,1))))
+
+    # objective
+    G = np.concatenate((np.eye(2), np.zeros((2,2))), axis=1)
+    G = np.kron(np.eye(self.N), G)
+    Q = np.eye(self.N * 2) # position x and y for each agent
+    controller.addObjectiveFun(lmpc.objectives.TerminalQuadForm(Q, np.zeros((self.N*2,1)), G))
+
+    controller._setupSolver(np.zeros((self.sys.Nx, 1)))
+
+    return controller
+
+  def export(self):
+    prob = self.controller.prob
+    variables = [self.controller.phi]
+    parameters = [self.controller.x0, self.controller.objectives[0].xTd]
+    return CvxpyLayer(prob, parameters, variables)
+

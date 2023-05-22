@@ -2,6 +2,7 @@
 .idea/
 /results/
 /.venv/
+deletable.*
 
 
 # Byte-compiled / optimized / DLL files
