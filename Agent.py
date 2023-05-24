@@ -48,7 +48,7 @@ class Agent:
         if self.use_mpc:
           logits = torch.sigmoid(logits)
           actions = self.mpc_layer.solve(obs, logits)  # (B, 2)
-          actions = torch.cat((actions, torch.zeros(batch_size, 1)), 1)
+          actions = torch.cat((torch.zeros(batch_size, 1).to(device), actions), 1)
         else:
           actions = F.gumbel_softmax(logits, hard=True)
         if model_out:
@@ -65,7 +65,7 @@ class Agent:
         if self.use_mpc:
           logits = torch.sigmoid(logits)
           actions = self.mpc_layer.solve(obs, logits)  # (B, 2)
-          actions = torch.cat((actions, torch.zeros(batch_size, 1)), 1)
+          actions = torch.cat((torch.zeros(batch_size, 1).to(device), actions), 1)
         else:
           actions = F.gumbel_softmax(logits, hard=True)
         return actions
@@ -160,17 +160,17 @@ class MPCLayer:
     # extend dynamics over horizon and batch size
     A = Ad.repeat(self.T, self.batch_size, 1, 1)
     B = Bd.repeat(self.T, self.batch_size, 1, 1)
-    F = torch.cat((A, B), dim=3)
+    F = torch.cat((A, B), dim=3).to(device)
     return LinDx(F)
 
   def _init_cost(self, xd: torch.Tensor):
     # Quadratic cost
-    xd = xd                                                           # (B, Ns) desired states
-    w = torch.tensor([1., 1., 1e-5, 1e-5])                            # (Ns,) state weights
-    q = torch.cat((w, 1e-5 * torch.ones(self.Na)))                    # (Ns+Na,) state-action weights
-    Q = torch.diag(q).repeat(self.T, self.batch_size, 1, 1)           # (T, B, Ns+Na, Ns+Na) weight matrix
-    px = -w * xd                                                      # (B, Ns) linear cost vector
-    p = torch.cat((px, torch.zeros((self.batch_size, self.Na))), 1)   # (T, B, Ns+Na) linear cost vector for state-action
+    xd = xd                                                                       # (B, Ns) desired states
+    w = torch.tensor([1., 1., 1e-5, 1e-5]).to(device)                             # (Ns,) state weights
+    q = torch.cat((w, 1e-5 * torch.ones(self.Na).to(device)))                     # (Ns+Na,) state-action weights
+    Q = torch.diag(q).repeat(self.T, self.batch_size, 1, 1)                       # (T, B, Ns+Na, Ns+Na) weight matrix
+    px = -w * xd                                                                  # (B, Ns) linear cost vector
+    p = torch.cat((px, torch.zeros((self.batch_size, self.Na)).to(device)), 1)   # (T, B, Ns+Na) linear cost vector for state-action
     p = p.repeat(self.T, 1, 1)
     cost = QuadCost(Q, p)
     return cost
@@ -184,7 +184,7 @@ class MPCLayer:
       self.Dx = self._init_model()
       self.u_init = None
     # Init cost wrt to desired states
-    xd = torch.cat((logits, torch.zeros((self.batch_size, 2))), 1)
+    xd = torch.cat((logits, torch.zeros((self.batch_size, 2)).to(device)), 1)
     self.cost = self._init_cost(xd)
     # recreate controller using updated u_init (kind of wasteful right?)
     ctrl = mpc.MPC(self.Ns, self.Na, self.T, u_lower=self.u_lower, u_upper=self.u_upper, 
@@ -192,11 +192,11 @@ class MPCLayer:
                   n_batch=self.batch_size, backprop=False, verbose=0, u_init=self.u_init,
                   grad_method=mpc.GradMethods.AUTO_DIFF)
     # initial state (always 0 in reference frame)
-    x_init = torch.cat((torch.zeros(self.batch_size, 2), obs[:, :2]), 1)
+    x_init = torch.cat((torch.zeros(self.batch_size, 2).to(device), obs[:, :2]), 1)
     # solve mpc problem
     _, nominal_actions, _ = ctrl(x_init, self.cost, self.Dx)
     # update u_init for warming starting at next step
-    self.u_init = torch.cat((nominal_actions[1:], torch.zeros(1, self.batch_size, self.Na)), dim=0)
+    self.u_init = torch.cat((nominal_actions[1:], torch.zeros(1, self.batch_size, self.Na).to(device)), dim=0)
     # return first action
     return nominal_actions[0]   # (B, Na)
 

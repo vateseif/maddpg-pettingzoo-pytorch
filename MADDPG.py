@@ -86,7 +86,7 @@ class MADDPG:
             o = torch.from_numpy(o).unsqueeze(0).float()
             a = self.agents[agent].action(o)  # torch.Size([1, action_size])
             # NOTE that the output is a tensor, convert it to int before input to the environment
-            action = a.squeeze(0).argmax().item() if self.discrete else a.squeeze(0).detach().numpy()
+            action = a.squeeze(0).argmax().item() if self.discrete else a.squeeze(0).cpu().detach().numpy()
             actions[agent] = action
             self.logger.info(f'{agent} action: {actions[agent]}')
         return actions
