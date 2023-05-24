@@ -13,8 +13,8 @@ if __name__ == '__main__':
     parser.add_argument('env_name', type=str, default='simple_adversary_v2', help='name of the env',
                         choices=list(name2env.keys()))
     parser.add_argument('folder', type=str, help='name of the folder where model is saved')
-    parser.add_argument('--episode-num', type=int, default=10, help='total episode num during evaluation')
-    parser.add_argument('--episode-length', type=int, default=50, help='steps per episode')
+    parser.add_argument('--episode_num', type=int, default=10, help='total episode num during evaluation')
+    parser.add_argument('--episode_length', type=int, default=50, help='steps per episode')
     parser.add_argument('--discrete', type=int, default=1, choices=[0,1], help='Discrete action space. If Falses it uses MPC')
 
     args = parser.parse_args()

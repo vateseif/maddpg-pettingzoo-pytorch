@@ -1,12 +1,14 @@
 from copy import deepcopy
 from typing import List, Optional
 
-import lmpc
+
 import torch
 import numpy as np
 import torch.nn.functional as F
 from torch import nn, Tensor
 from torch.optim import Adam
+from mpc import mpc
+from mpc.mpc import QuadCost, LinDx, GradMethods
 
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -16,10 +18,9 @@ class Agent:
 
     def __init__(self, obs_dim, act_dim, global_obs_dim, actor_lr, critic_lr, use_mpc=False):
         self.use_mpc = use_mpc
-        self.actor = MLPNetwork(obs_dim, act_dim).to(device)
         if use_mpc:
-          self.mpc = LMPCLayer()
-
+          self.mpc_layer = MPCLayer()
+        self.actor = MLPNetwork(obs_dim, act_dim).to(device)
         # critic input all the observations and actions
         # if there are 3 agents for example, the input for critic is (obs1, obs2, obs3, act1, act2, act3)
         self.critic = MLPNetwork(global_obs_dim, 1).to(device)
@@ -41,18 +42,13 @@ class Agent:
         # a) interact with the environment
         # b) calculate action when update actor, where input(obs) is sampled from replay buffer with size:
         # torch.Size([batch_size, state_dim])
-        
-        logits = self.actor(obs.to(device))  # torch.Size([batch_size, action_size])
-        print(logits)
-        batch_dim, act_dim = logits.shape
-        # action = self.gumbel_softmax(logits)
+        obs = obs.to(device)
+        logits = self.actor(obs)  # torch.Size([batch_size, action_size])
+        batch_size = logits.shape[0]
         if self.use_mpc:
-          actions = []
-          for i in range(batch_dim):
-            x0 = np.concatenate((np.ones((2,1))*1e-3, np.array([[obs[i][0]], [obs[i][1]]])))
-            action = self.mpc.act(x0, torch.reshape(logits[i], (act_dim,1)).detach().numpy())
-            actions.append(torch.tensor(action))
-          actions = torch.vstack(actions)
+          logits = torch.sigmoid(logits)
+          actions = self.mpc_layer.solve(obs, logits)  # (B, 2)
+          actions = torch.cat((actions, torch.zeros(batch_size, 1)), 1)
         else:
           actions = F.gumbel_softmax(logits, hard=True)
         if model_out:
@@ -63,17 +59,13 @@ class Agent:
         # when calculate target critic value in MADDPG,
         # we use target actor to get next action given next states,
         # which is sampled from replay buffer with size torch.Size([batch_size, state_dim])
-
-        logits = self.target_actor(obs.to(device))  # torch.Size([batch_size, action_size])
-        batch_dim, act_dim = logits.shape
-        # action = self.gumbel_softmax(logits)
+        obs = obs.to(device)
+        logits = self.actor(obs)  # torch.Size([batch_size, action_size])
+        batch_size = logits.shape[0]
         if self.use_mpc:
-          actions = []
-          for i in range(batch_dim):
-            x0 = np.concatenate((np.ones((2,1))*1e-3, np.array([[obs[i][0]], [obs[i][1]]])))
-            action = self.mpc.act(x0, torch.reshape(logits[i], (act_dim,1)).detach().numpy())
-            actions.append(torch.tensor(action))
-          actions = torch.vstack(actions)
+          logits = torch.sigmoid(logits)
+          actions = self.mpc_layer.solve(obs, logits)  # (B, 2)
+          actions = torch.cat((actions, torch.zeros(batch_size, 1)), 1)
         else:
           actions = F.gumbel_softmax(logits, hard=True)
         return actions
@@ -123,12 +115,10 @@ class MLPNetwork(nn.Module):
         return self.net(x)
 
 
-class LMPCLayer:
+class MPCLayer:
 
-  def __init__(self, locality: Optional[str]=None) -> None:
-    self.N = 1
-    self.locality = locality
-    
+  def __init__(self) -> None:
+    self.N = 1    
     self.Ns = 4
     self.Na = 4
     self.T = 15
@@ -138,64 +128,76 @@ class LMPCLayer:
     self.size = 0.075
     self.max_speed = None
     self.sensitivity = 5.
+    self.LQR_ITER = 100
+    self.u_upper = 1.
+    self.u_lower = 0.
 
-    # system model
-    self.sys = self._init_model()
+    self.u_init = None
+    self.batch_size = None
+
+    # model dy namics
+    self.Dx = None
     
+    # cost
+    self.cost = None
+
     # controller
-    self.controller = self._init_controller()
+    self.controller = None
 
   def _init_model(self):
     # dynamics of 1 single agent
-    A1 = np.array([[0, 0, 1, 0], 
+    A1 = torch.tensor([[0, 0, 1, 0], 
                   [0, 0, 0, 1], 
                   [0, 0, -self.tau/self.dt, 0], 
                   [0, 0, 0, -self.tau/self.dt]])
-    B1 = np.array([[0, 0, 0, 0], 
+    B1 = torch.tensor([[0, 0, 0, 0], 
                   [0, 0, 0, 0], 
                   [1, -1, 0, 0], 
                   [0, 0, 1, -1]]) 
-    # dynamics of n agents
-    A = np.kron(np.eye(self.N), A1)
-    B = np.kron(np.eye(self.N), B1)
     # discrete dynamics
-    Ad = np.eye(A.shape[0]) + A*self.dt
-    Bd = B*self.dt*self.sensitivity
-    
-    # init sys
-    sys = lmpc.DistributedLTI(self.N, self.Ns, self.Na)
-    sys.loadAB(Ad, Bd)
+    Ad = torch.eye(A1.shape[0]) + A1*self.dt
+    Bd = B1*self.dt*self.sensitivity
+    # extend dynamics over horizon and batch size
+    A = Ad.repeat(self.T, self.batch_size, 1, 1)
+    B = Bd.repeat(self.T, self.batch_size, 1, 1)
+    F = torch.cat((A, B), dim=3)
+    return LinDx(F)
 
-    # locality model
-    if self.locality != None:
-      locality = None
-      sys << locality
-      pass
-    return sys
+  def _init_cost(self, xd: torch.Tensor):
+    # Quadratic cost
+    xd = xd                                                           # (B, Ns) desired states
+    w = torch.tensor([1., 1., 1e-5, 1e-5])                            # (Ns,) state weights
+    q = torch.cat((w, 1e-5 * torch.ones(self.Na)))                    # (Ns+Na,) state-action weights
+    Q = torch.diag(q).repeat(self.T, self.batch_size, 1, 1)           # (T, B, Ns+Na, Ns+Na) weight matrix
+    px = -w * xd                                                      # (B, Ns) linear cost vector
+    p = torch.cat((px, torch.zeros((self.batch_size, self.Na))), 1)   # (T, B, Ns+Na) linear cost vector for state-action
+    p = p.repeat(self.T, 1, 1)
+    cost = QuadCost(Q, p)
+    return cost
 
-  def _init_controller(self):
-    # controller
-    controller = lmpc.LMPC(self.T)
-    controller << self.sys
-    
-    # box constraints control inputs
-    controller.addConstraint(lmpc.BoundConstraint('u', 'upper', (1-self.eps)*np.ones((self.sys.Nu,1))))
-    controller.addConstraint(lmpc.BoundConstraint('u', 'lower', self.eps * np.ones((self.sys.Nu,1))))
 
-    # objective
-    G = np.concatenate((np.eye(2), np.zeros((2,2))), axis=1)
-    G = np.kron(np.eye(self.N), G)
-    Q = np.eye(self.N * 2) # position x and y for each agent
-    controller.addObjectiveFun(lmpc.objectives.TerminalQuadForm(Q, np.zeros((self.N*2,1)), G))
+  def solve(self, obs: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+    batch_size, _ = logits.shape
+    # Update dynamics if batch_size changes
+    if batch_size != self.batch_size:
+      self.batch_size = batch_size
+      self.Dx = self._init_model()
+      self.u_init = None
+    # Init cost wrt to desired states
+    xd = torch.cat((logits, torch.zeros((self.batch_size, 2))), 1)
+    self.cost = self._init_cost(xd)
+    # recreate controller using updated u_init (kind of wasteful right?)
+    ctrl = mpc.MPC(self.Ns, self.Na, self.T, u_lower=self.u_lower, u_upper=self.u_upper, 
+                  lqr_iter=self.LQR_ITER, exit_unconverged=False, eps=1e-2,
+                  n_batch=self.batch_size, backprop=False, verbose=0, u_init=self.u_init,
+                  grad_method=mpc.GradMethods.AUTO_DIFF)
+    # initial state (always 0 in reference frame)
+    x_init = torch.cat((torch.zeros(self.batch_size, 2), obs[:, :2]), 1)
+    # solve mpc problem
+    _, nominal_actions, _ = ctrl(x_init, self.cost, self.Dx)
+    # update u_init for warming starting at next step
+    self.u_init = torch.cat((nominal_actions[1:], torch.zeros(1, self.batch_size, self.Na)), dim=0)
+    # return first action
+    return nominal_actions[0]   # (B, Na)
 
-    controller._setupSolver(np.zeros((self.sys.Nx, 1)))
-
-    return controller
-
-  def act(self, x0, logits):
-    self.controller.objectives[0].xTd.value = logits
-    u, _, _ = self.controller.solve(x0, "SCS")
-    action = np.concatenate(([0], u.squeeze()[0:self.Na]), dtype=np.float32)
-      
-    return action
 
