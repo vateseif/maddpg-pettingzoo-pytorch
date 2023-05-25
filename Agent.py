@@ -12,6 +12,7 @@ from mpc.mpc import QuadCost, LinDx, GradMethods
 
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
+device = "cpu"
 
 class Agent:
     """Agent that can interact with environment from pettingzoo"""
@@ -46,7 +47,7 @@ class Agent:
         logits = self.actor(obs)  # torch.Size([batch_size, action_size])
         batch_size = logits.shape[0]
         if self.use_mpc:
-          logits = torch.sigmoid(logits)
+          logits = torch.tanh(logits)
           actions = self.mpc_layer.solve(obs, logits)  # (B, 2)
           actions = torch.cat((torch.zeros(batch_size, 1).to(device), actions), 1)
         else:
@@ -63,7 +64,7 @@ class Agent:
         logits = self.actor(obs)  # torch.Size([batch_size, action_size])
         batch_size = logits.shape[0]
         if self.use_mpc:
-          logits = torch.sigmoid(logits)
+          logits = torch.tanh(logits)
           actions = self.mpc_layer.solve(obs, logits)  # (B, 2)
           actions = torch.cat((torch.zeros(batch_size, 1).to(device), actions), 1)
         else:
@@ -121,7 +122,7 @@ class MPCLayer:
     self.N = 1    
     self.Ns = 4
     self.Na = 4
-    self.T = 15
+    self.T = 5
     self.dt = 0.1              # TODO get val from env
     self.tau = 0.25            # TODO get val from env
     self.eps = 1e-3
@@ -166,13 +167,14 @@ class MPCLayer:
   def _init_cost(self, xd: torch.Tensor):
     # Quadratic cost
     xd = xd                                                                       # (B, Ns) desired states
-    w = torch.tensor([1., 1., 1e-5, 1e-5]).to(device)                             # (Ns,) state weights
-    q = torch.cat((w, 1e-5 * torch.ones(self.Na).to(device)))                     # (Ns+Na,) state-action weights
+    w = torch.tensor([1., 1., 1e-1, 1e-1]).to(device)                             # (Ns,) state weights
+    q = torch.cat((w, 1e-1*torch.ones(self.Na).to(device)))                     # (Ns+Na,) state-action weights
     Q = torch.diag(q).repeat(self.T, self.batch_size, 1, 1)                       # (T, B, Ns+Na, Ns+Na) weight matrix
-    px = -w * xd                                                                  # (B, Ns) linear cost vector
-    p = torch.cat((px, torch.zeros((self.batch_size, self.Na)).to(device)), 1)   # (T, B, Ns+Na) linear cost vector for state-action
+    px = -torch.sqrt(w) * xd                                                                  # (B, Ns) linear cost vector
+    p = torch.cat((px, 1e-2*torch.ones((self.batch_size, self.Na)).to(device)), 1)   # (T, B, Ns+Na) linear cost vector for state-action
     p = p.repeat(self.T, 1, 1)
     cost = QuadCost(Q, p)
+
     return cost
 
 
@@ -189,14 +191,15 @@ class MPCLayer:
     # recreate controller using updated u_init (kind of wasteful right?)
     ctrl = mpc.MPC(self.Ns, self.Na, self.T, u_lower=self.u_lower, u_upper=self.u_upper, 
                   lqr_iter=self.LQR_ITER, exit_unconverged=False, eps=1e-2,
-                  n_batch=self.batch_size, backprop=False, verbose=0, u_init=self.u_init,
+                  n_batch=self.batch_size, backprop=True, verbose=0, u_init=self.u_init,
                   grad_method=mpc.GradMethods.AUTO_DIFF)
     # initial state (always 0 in reference frame)
-    x_init = torch.cat((torch.zeros(self.batch_size, 2).to(device), obs[:, :2]), 1)
+    x_init = torch.cat((torch.zeros(batch_size, 2).to(device), obs[:, :2]), 1)
     # solve mpc problem
     _, nominal_actions, _ = ctrl(x_init, self.cost, self.Dx)
+    #print(logits)
     # update u_init for warming starting at next step
-    self.u_init = torch.cat((nominal_actions[1:], torch.zeros(1, self.batch_size, self.Na).to(device)), dim=0)
+    #self.u_init = torch.cat((nominal_actions[1:], torch.zeros(1, self.batch_size, self.Na).to(device)), dim=0)
     # return first action
     return nominal_actions[0]   # (B, Na)
 
